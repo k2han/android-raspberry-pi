@@ -27,6 +27,9 @@ PRODUCT_COPY_FILES += \
 PRODUCT_COPY_FILES += \
     glodroid/configuration/common/no_suspend.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/no_suspend.rpi4.rc \
 
+# Default to stock clocks unless the user opts in.
+PRODUCT_VENDOR_PROPERTIES += persist.tesla-android.perf_profile=default
+
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/etc/power.rpi4.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/power.rpi4.rc \
     $(LOCAL_PATH)/etc/snd.rpi4.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/snd.rpi4.rc     \
