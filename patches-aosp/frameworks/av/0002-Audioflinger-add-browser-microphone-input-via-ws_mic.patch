@@ -1,16 +1,16 @@
-From 8b7e000c34d4307ed6157c8ff368e66965b4a3e6 Mon Sep 17 00:00:00 2001
+From 875bdefe6b715437d57a3fd6874f4da9358a4986 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Micha=C5=82=20Gapi=C5=84ski?= <mike@gapinski.eu>
 Date: Wed, 4 Nov 2026 10:06:56 +0000
 Subject: [PATCH] Audioflinger: add browser microphone input via ws_mic
 
 Read framed mono s16le 48 kHz microphone audio without blocking capture. Bound buffering and drain work, resample to the HAL format, and retain HAL input when disabled. Keep primary capture on the normal path so fast clients cannot bypass the replacement.
 ---
- services/audioflinger/Threads.cpp | 130 ++++++++++++++++++++++++++++++
+ services/audioflinger/Threads.cpp | 133 ++++++++++++++++++++++++++++++
  services/audioflinger/Threads.h   |  16 ++++
- 2 files changed, 146 insertions(+)
+ 2 files changed, 149 insertions(+)
 
 diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
-index d132a01..43d0ad6 100644
+index d132a01..13a2ce3 100644
 --- a/services/audioflinger/Threads.cpp
 +++ b/services/audioflinger/Threads.cpp
 @@ -7951,6 +7951,13 @@ AudioFlinger::RecordThread::RecordThread(const sp<AudioFlinger>& audioFlinger,
@@ -35,7 +35,7 @@ index d132a01..43d0ad6 100644
      if (mFastCapture != 0) {
          FastCaptureStateQueue *sq = mFastCapture->sq();
          FastCaptureState *state = sq->begin();
-@@ -8073,6 +8081,116 @@ void AudioFlinger::RecordThread::preExit()
+@@ -8073,6 +8081,119 @@ void AudioFlinger::RecordThread::preExit()
      mStartStopCond.broadcast();
  }
  
@@ -81,7 +81,6 @@ index d132a01..43d0ad6 100644
 +
 +    openMicSocket();
 +    // Bound the drain as well as storage: an always-ready producer must not starve capture.
-+    // If more than this is queued, discard the connection rather than replay stale audio.
 +    size_t budget = 65536;
 +    while (mMicFd >= 0 && budget > 0) {
 +        uint8_t data[4096];
@@ -122,7 +121,11 @@ index d132a01..43d0ad6 100644
 +            --mMicRemaining;
 +        }
 +    }
-+    if (budget == 0) closeMicSocket();
++    if (budget == 0) {
++        // Keep framing intact for arbitrarily large messages, but do not replay a backlog.
++        mMicFront = mMicCount = 0;
++        mMicPhase = 0;
++    }
 +
 +    for (size_t frame = 0; frame < frames; ++frame) {
 +        int64_t sample = 0;
@@ -152,7 +155,7 @@ index d132a01..43d0ad6 100644
  bool AudioFlinger::RecordThread::threadLoop()
  {
      nsecs_t lastWarning = 0;
-@@ -8105,12 +8223,18 @@ reacquire_wakelock:
+@@ -8105,12 +8226,18 @@ reacquire_wakelock:
          sp<RecordTrack> fastTrackToRemove;
  
          bool silenceFastCapture = false;
@@ -171,7 +174,7 @@ index d132a01..43d0ad6 100644
              // check exitPending here because checkForNewParameters_l() and
              // checkForNewParameters_l() can temporarily release mLock
              if (exitPending()) {
-@@ -8389,6 +8513,11 @@ reacquire_wakelock:
+@@ -8389,6 +8516,11 @@ reacquire_wakelock:
              }
          }
  
@@ -183,7 +186,7 @@ index d132a01..43d0ad6 100644
          const int64_t lastIoEndNs = systemTime(); // end IO timing
  
          // Update server timestamp with server stats
-@@ -8665,6 +8794,7 @@ void AudioFlinger::RecordThread::standbyIfNotAlreadyInStandby()
+@@ -8665,6 +8797,7 @@ void AudioFlinger::RecordThread::standbyIfNotAlreadyInStandby()
  
  void AudioFlinger::RecordThread::inputStandBy()
  {
