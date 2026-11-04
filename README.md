@@ -54,7 +54,8 @@ Set the property to `default` to disable the profile. After the boot-files updat
 rewrites `config.txt`, it must run
 `/vendor/bin/apply_rpi4_perf_profile.sh <config.txt-path>` to apply the selected
 profile. The helper is idempotent and removes the marked profile block in `default`
-mode. The boot-files updater is not included in this repository.
+mode. Reboot after the updater applies the change. The boot-files updater is not
+included in this repository.
 
 Overclocking requires adequate cooling and a stable 5V/3A power supply. Higher
 temperatures or inadequate power may cause instability or damage.
