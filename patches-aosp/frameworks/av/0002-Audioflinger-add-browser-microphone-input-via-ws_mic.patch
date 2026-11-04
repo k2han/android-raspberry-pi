@@ -1,0 +1,226 @@
+From 875bdefe6b715437d57a3fd6874f4da9358a4986 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Micha=C5=82=20Gapi=C5=84ski?= <mike@gapinski.eu>
+Date: Wed, 4 Nov 2026 10:06:56 +0000
+Subject: [PATCH] Audioflinger: add browser microphone input via ws_mic
+
+Read framed mono s16le 48 kHz microphone audio without blocking capture. Bound buffering and drain work, resample to the HAL format, and retain HAL input when disabled. Keep primary capture on the normal path so fast clients cannot bypass the replacement.
+---
+ services/audioflinger/Threads.cpp | 133 ++++++++++++++++++++++++++++++
+ services/audioflinger/Threads.h   |  16 ++++
+ 2 files changed, 149 insertions(+)
+
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index d132a01..13a2ce3 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -7951,6 +7951,13 @@ AudioFlinger::RecordThread::RecordThread(const sp<AudioFlinger>& audioFlinger,
+     // case FastCapture_Dynamic:
+     }
+ 
++    // Fast clients read the HAL pipe directly, bypassing RecordThread's mic replacement.
++    // Keep primary input on the normal path even when browser mic is toggled at runtime.
++    if (mInput->audioHwDev != nullptr
++            && strcmp(mInput->audioHwDev->moduleName(), AUDIO_HARDWARE_MODULE_ID_PRIMARY) == 0) {
++        initFastCapture = false;
++    }
++
+     if (initFastCapture) {
+         // create a Pipe for FastCapture to write to, and for us and fast tracks to read from
+         NBAIO_Format format = mInputSource->format();
+@@ -8036,6 +8043,7 @@ failed: ;
+ 
+ AudioFlinger::RecordThread::~RecordThread()
+ {
++    closeMicSocket();
+     if (mFastCapture != 0) {
+         FastCaptureStateQueue *sq = mFastCapture->sq();
+         FastCaptureState *state = sq->begin();
+@@ -8073,6 +8081,119 @@ void AudioFlinger::RecordThread::preExit()
+     mStartStopCond.broadcast();
+ }
+ 
++void AudioFlinger::RecordThread::closeMicSocket()
++{
++    if (mMicFd >= 0) {
++        close(mMicFd);
++        mMicRetryAt = systemTime() + seconds(1);
++    }
++    mMicFd = -1;
++    mMicFront = mMicCount = 0;
++    mMicPhase = 0;
++    mMicLength = mMicRemaining = 0;
++    mMicHeaderBytes = 0;
++}
++
++void AudioFlinger::RecordThread::openMicSocket()
++{
++    if (mMicFd >= 0 || systemTime() < mMicRetryAt) return;
++    mMicRetryAt = systemTime() + seconds(1);
++
++    // Non-blocking before connect: a full Unix socket listen queue must not stall recording.
++    mMicFd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++    if (mMicFd < 0) return;
++
++    struct sockaddr_un addr = {};
++    addr.sun_family = AF_UNIX;
++    strncpy(addr.sun_path, "/dev/socket/ws_mic", sizeof(addr.sun_path) - 1);
++    if (TEMP_FAILURE_RETRY(connect(mMicFd, (struct sockaddr*)&addr, sizeof(addr))) < 0) {
++        closeMicSocket();
++    }
++}
++
++void AudioFlinger::RecordThread::readMicBuffer(void* buffer, size_t frames, bool primaryInput)
++{
++    if (!primaryInput
++            || !property_get_bool("persist.tesla-android.browser_mic.is_enabled", true)
++            || (mFormat != AUDIO_FORMAT_PCM_16_BIT && mFormat != AUDIO_FORMAT_PCM_FLOAT)
++            || (mChannelCount != 1 && mChannelCount != 2) || mSampleRate == 0) {
++        if (mMicFd >= 0) closeMicSocket();
++        return;
++    }
++
++    openMicSocket();
++    // Bound the drain as well as storage: an always-ready producer must not starve capture.
++    size_t budget = 65536;
++    while (mMicFd >= 0 && budget > 0) {
++        uint8_t data[4096];
++        const ssize_t count = TEMP_FAILURE_RETRY(
++                recv(mMicFd, data, std::min(sizeof(data), budget), MSG_DONTWAIT));
++        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
++        if (count <= 0) {
++            closeMicSocket();
++            break;
++        }
++        budget -= count;
++        for (ssize_t i = 0; i < count; ++i) {
++            if (mMicRemaining == 0) {
++                mMicLength = (mMicLength << 8) | data[i];
++                if (++mMicHeaderBytes == 4) {
++                    mMicRemaining = mMicLength;
++                    mMicLength = 0;
++                    mMicHeaderBytes = 0;
++                    if (mMicRemaining & 1) {
++                        closeMicSocket();
++                        break;
++                    }
++                }
++                continue;
++            }
++            if ((mMicRemaining & 1) == 0) {
++                mMicLowByte = data[i];
++            } else {
++                if (mMicCount == kMicCapacity) {
++                    mMicFront = (mMicFront + 1) % kMicCapacity;
++                    --mMicCount;
++                    mMicPhase = 0;
++                }
++                const uint16_t sample = mMicLowByte | (uint16_t(data[i]) << 8);
++                mMicBuffer[(mMicFront + mMicCount++) % kMicCapacity] =
++                        sample < 0x8000 ? int16_t(sample) : int16_t(int32_t(sample) - 0x10000);
++            }
++            --mMicRemaining;
++        }
++    }
++    if (budget == 0) {
++        // Keep framing intact for arbitrarily large messages, but do not replay a backlog.
++        mMicFront = mMicCount = 0;
++        mMicPhase = 0;
++    }
++
++    for (size_t frame = 0; frame < frames; ++frame) {
++        int64_t sample = 0;
++        if (mMicCount > 0) {
++            const int16_t first = mMicBuffer[mMicFront];
++            const int16_t next = mMicCount > 1
++                    ? mMicBuffer[(mMicFront + 1) % kMicCapacity] : first;
++            sample = (int64_t(first) * (int64_t(mSampleRate) - int64_t(mMicPhase))
++                    + int64_t(next) * int64_t(mMicPhase)) / mSampleRate;
++            mMicPhase += 48000;
++            const size_t consumed = std::min<size_t>(mMicPhase / mSampleRate, mMicCount);
++            mMicFront = (mMicFront + consumed) % kMicCapacity;
++            mMicCount -= consumed;
++            mMicPhase = mMicCount > 0 ? mMicPhase % mSampleRate : 0;
++        }
++        for (uint32_t channel = 0; channel < mChannelCount; ++channel) {
++            const size_t index = frame * mChannelCount + channel;
++            if (mFormat == AUDIO_FORMAT_PCM_FLOAT) {
++                static_cast<float*>(buffer)[index] = sample / 32768.f;
++            } else {
++                static_cast<int16_t*>(buffer)[index] = sample;
++            }
++        }
++    }
++}
++
+ bool AudioFlinger::RecordThread::threadLoop()
+ {
+     nsecs_t lastWarning = 0;
+@@ -8105,12 +8226,18 @@ reacquire_wakelock:
+         sp<RecordTrack> fastTrackToRemove;
+ 
+         bool silenceFastCapture = false;
++        bool browserMicInput = false;
+ 
+         { // scope for mLock
+             Mutex::Autolock _l(mLock);
+ 
+             processConfigEvents_l();
+ 
++            browserMicInput = mInput != nullptr && mInput->audioHwDev != nullptr
++                    && strcmp(mInput->audioHwDev->moduleName(),
++                            AUDIO_HARDWARE_MODULE_ID_PRIMARY) == 0
++                    && inDeviceType() == AUDIO_DEVICE_IN_BUILTIN_MIC;
++
+             // check exitPending here because checkForNewParameters_l() and
+             // checkForNewParameters_l() can temporarily release mLock
+             if (exitPending()) {
+@@ -8389,6 +8516,11 @@ reacquire_wakelock:
+             }
+         }
+ 
++        if (framesRead > 0) {
++            readMicBuffer((uint8_t*)mRsmpInBuffer + rear * mFrameSize,
++                    framesRead, browserMicInput);
++        }
++
+         const int64_t lastIoEndNs = systemTime(); // end IO timing
+ 
+         // Update server timestamp with server stats
+@@ -8665,6 +8797,7 @@ void AudioFlinger::RecordThread::standbyIfNotAlreadyInStandby()
+ 
+ void AudioFlinger::RecordThread::inputStandBy()
+ {
++    closeMicSocket();
+     // Idle the fast capture if it's currently running
+     if (mFastCapture != 0) {
+         FastCaptureStateQueue *sq = mFastCapture->sq();
+diff --git a/services/audioflinger/Threads.h b/services/audioflinger/Threads.h
+index 21c41d3..0c3f97a 100644
+--- a/services/audioflinger/Threads.h
++++ b/services/audioflinger/Threads.h
+@@ -2064,6 +2064,22 @@ private:
+ 
+             void    checkBtNrec_l();
+ 
++            void    openMicSocket();
++            void    closeMicSocket();
++            void    readMicBuffer(void* buffer, size_t frames, bool primaryInput);
++
++            int mMicFd = -1;
++            nsecs_t mMicRetryAt = 0;
++            static constexpr size_t kMicCapacity = 48000 / 5;
++            int16_t mMicBuffer[kMicCapacity] = {};
++            size_t mMicFront = 0;
++            size_t mMicCount = 0;
++            uint64_t mMicPhase = 0;
++            uint32_t mMicLength = 0;
++            uint32_t mMicRemaining = 0;
++            size_t mMicHeaderBytes = 0;
++            uint8_t mMicLowByte = 0;
++
+             int32_t getOldestFront_l();
+             void    updateFronts_l(int32_t offset);
+ 
+-- 
+2.56.0
+

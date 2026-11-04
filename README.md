@@ -42,6 +42,10 @@ Run .*/flash-sd.sh* utility for flashing Android to sdcard
   
 *After several minutes flashing should complete, and Android should boot*  
 
+## Browser microphone input
+
+With compatible browser and audio-relay components installed, AudioFlinger replaces the primary HAL's built-in microphone (the Dummy input) with cabin-microphone audio from `/dev/socket/ws_mic`: unsigned 32-bit big-endian byte length followed by signed 16-bit little-endian mono PCM at 48 kHz. Reads and connections are non-blocking, buffering is limited to 200 ms with oldest samples dropped, and missing audio becomes silence. PCM16/float mono/stereo inputs are supported, with linear resampling when needed; primary-HAL fast capture is disabled so clients cannot bypass the replacement. The feature defaults to enabled; use `adb shell setprop persist.tesla-android.browser_mic.is_enabled false` to close the socket and retain the original HAL input, or set it to `true` to restore browser input. The browser and relay must separately provide microphone forwarding, socket access permissions, and stop-time buffer flushing.
+
 ## Building from sources
 
 Before building, ensure your system has at least 32GB of RAM, a swap file is at least 8GB, and 300GB of free disk space available.
