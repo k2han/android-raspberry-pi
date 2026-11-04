@@ -42,6 +42,24 @@ Run .*/flash-sd.sh* utility for flashing Android to sdcard
   
 *After several minutes flashing should complete, and Android should boot*  
 
+## Raspberry Pi 4 performance profile
+
+The optional performance profile raises the Pi 4 CPU and GPU clocks. Enable it with:
+
+```bash
+adb shell setprop persist.tesla-android.perf_profile performance
+```
+
+Set the property to `default` to disable the profile. After the boot-files updater
+rewrites `config.txt`, it must run
+`/vendor/bin/apply_rpi4_perf_profile.sh <config.txt-path>` to apply the selected
+profile. The helper is idempotent and removes the marked profile block in `default`
+mode. Reboot after the updater applies the change. The boot-files updater is not
+included in this repository.
+
+Overclocking requires adequate cooling and a stable 5V/3A power supply. Higher
+temperatures or inadequate power may cause instability or damage.
+
 ## Building from sources
 
 Before building, ensure your system has at least 32GB of RAM, a swap file is at least 8GB, and 300GB of free disk space available.

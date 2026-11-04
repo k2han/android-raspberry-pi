@@ -38,7 +38,8 @@ SYSFS_MMC0_PATH := emmc2bus/fe340000.mmc
 RPI_CONFIG := $(LOCAL_PATH)/boot/config.txt
 
 PRODUCT_COPY_FILES += \
-    $(LOCAL_PATH)/boot/config.txt:$(TARGET_COPY_OUT_VENDOR_DLKM)/boot/config.txt
+    $(LOCAL_PATH)/boot/config.txt:$(TARGET_COPY_OUT_VENDOR_DLKM)/boot/config.txt \
+    $(LOCAL_PATH)/boot/apply_perf_profile.sh:$(TARGET_COPY_OUT_VENDOR)/bin/apply_rpi4_perf_profile.sh
 
 GD_NO_DEFAULT_MODEM := true
 
